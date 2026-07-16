@@ -1,0 +1,648 @@
+# esphome-growatt-bridge
+# Version 1.0
+# 
+#
+# ESPhome bridge based on an ESP32-C3 to control a single phase Growatt inverter (MIC or MID TL-X type via MODbus by Home Assistant. The bride exposed a web-site and publish values to i.e. Victron by Sunspec.
+# Also Victron dynamic power reduction is supported. Check Settings => Integrations => PV_inverters => Select your device => Enable Dynamic power reduction
+# It is also possible to reduce the power by RRCR (Radio Ripple Control Receiver) / DRM (Demand Response Mode). However this is not enabled on most Growatt inverters. 
+# It should be possible to anable RRCD/DRM via ShineTools app or the inverter's local settings.
+#
+# A special thanks to following repositories and information to create this file
+# https://github.com/JasperE84/Growatt_ESPHome_ESP32_Modbus_RS485_Example
+# https://github.com/mahoekst/SunspecModbusServer/tree/main
+# https://gathering.tweakers.net/forum/list_messages/2153412
+
+
+substitutions:
+  device_name: growatt-bridge-c3
+  friendly_name: Growatt Bridge c3
+  manufacturer: "Growatt"
+  model: "MIC 3000TL-X"
+  serial: "QUH8CKT07Q"
+  version: "PV00.0038500"
+  max_power: "3000"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -200  # After WiFi and modbus are up
+    then:
+      # Publish 0 for all measurement sensors so they show 0 instead of NA
+      # when the inverter is off (e.g. after a night reboot). Totals are left
+      # as NA since 0 would be misleading.
+      # Power rate is initialised to 100% — register 3 is unreliable when the
+      # inverter is off. Victron will write the correct value when it connects.
+      - lambda: |-
+          id(DC1_Voltage).publish_state(0);
+          id(DC1_Current).publish_state(0);
+          id(DC1_Power).publish_state(0);
+          id(AC_Voltage).publish_state(0);
+          id(AC_active_Power).publish_state(0);
+          id(AC_Frequency).publish_state(0);
+          id(Heatsink_temperature).publish_state(0);
+          id(Active_Power_Rate).publish_state(100);
+      - select.set:
+          id: rrcr_power_level
+          option: "100%"
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: arduino
+
+
+# Enable logging
+logger:
+  level: INFO
+  logs:
+    modbus_controller: ERROR # Prevent [modbus_controller:063] Received modbus data but command queue is empty messages showing all the time
+    modbus: ERROR # Prevent [modbus:064] Stop waiting for response from 1 messages when inverter is off
+    #sunspec_modbus_server: DEBUG  #if you want to see the raw SunSpec Modbus TCP communication for debugging
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 60min
+  encryption:
+    key: !secret esphome_api_key
+
+ota:
+  - platform: esphome
+    password: !secret esphome_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.1.33
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0   
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Growatt-Bridge-C3"
+    password: !secret esphome_ap_password
+
+time:
+  - platform: homeassistant
+    
+captive_portal:
+
+web_server:
+  port: 80
+  version: 3
+  sorting_groups:
+    - id: group_ac
+      name: "AC Output"
+      sorting_weight: 1
+    - id: group_dc
+      name: "DC Input (PV)"
+      sorting_weight: 2
+    - id: group_control
+      name: "Control"
+      sorting_weight: 3
+    - id: group_device
+      name: "Device"
+      sorting_weight: 4
+
+# Define the pins as outputs
+output:
+  - platform: gpio
+    id: led_red_output
+    pin: 
+      number: GPIO8
+      inverted: true
+  - platform: gpio
+    id: led_green_output
+    pin: 
+      number: GPIO5
+      inverted: true
+      
+switch:
+  - platform: gpio
+    id: relay_k1_0pct
+    pin: 
+      number: GPIO6
+      inverted: true
+    restore_mode: ALWAYS_OFF
+  - platform: gpio
+    id: relay_k2_30pct
+    pin: 
+      number: GPIO3
+      inverted: true
+    restore_mode: ALWAYS_OFF
+  - platform: gpio
+    id: relay_k3_60pct
+    pin: 
+      number: GPIO9
+      inverted: true
+    restore_mode: ALWAYS_OFF
+  - platform: gpio
+    id: relay_k4_100pct
+    pin: 
+      number: GPIO10
+      inverted: true
+    restore_mode: ALWAYS_ON
+
+  # Growatt r/w setting writers
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Inverter On - Off"
+    id: "Inverter_On_Off"
+    web_server:
+      sorting_group_id: group_control
+      sorting_weight: 1
+    register_type: holding
+    address: 0
+    bitmask: 1 # Assuming 1 is ON, 0 is OFF
+    entity_category: config
+    icon: mdi:toggle-switch
+
+light:
+  - platform: binary
+    name: "Red LED"
+    output: led_red_output
+    id: led_red
+    internal: true
+  - platform: binary
+    name: "Green LED"
+    output: led_green_output
+    id: led_green
+    internal: true
+
+# UART for RS485 communication with inverter
+uart:
+  - id: uart_pv
+    rx_pin: GPIO20  # RX D6 = GPIO09
+    tx_pin: GPIO21  # TX D7 = GPIO10
+    baud_rate: 9600
+    stop_bits: 1
+    parity: NONE
+
+
+# Modbus RTU client (used by growatt_solar)
+modbus:
+  - uart_id: uart_pv
+    flow_control_pin: GPIO07  #D5
+    id: modbus_client
+    send_wait_time: 1000ms
+
+# Modbus controller for Growatt inverter (write-only, for power control)
+modbus_controller:
+  - id: modbus_pv
+    address: 0x1   ## address of the Modbus slave device on the bus
+    modbus_id: modbus_client
+    setup_priority: -10
+    update_interval: 10s
+    command_throttle: 1000ms
+
+# External component from GitHub
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ sunspec_modbus_server ]
+
+
+number:
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Active Power Rate"
+    id: "Active_Power_Rate"
+    web_server:
+      sorting_group_id: group_control
+      sorting_weight: 2
+    register_type: holding
+    address: 3
+    value_type: U_WORD
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    multiply: 1 
+    entity_category: config
+    icon: mdi:gauge
+    mode: SLIDER
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= 100;'
+            then:
+              - script.stop: blink_led
+              - light.turn_on: led_green
+            else:
+              - script.execute: blink_led
+
+script:
+  - id: blink_led
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return id(Active_Power_Rate).state < 100;'
+          then:
+            - light.turn_on: led_green
+            - delay: !lambda |-
+                float x = id(Active_Power_Rate).state;
+                // fast (~100ms) near 99, slow (~1000ms) near 0
+                return (int) (1000 - (x / 100.0) * 900);
+            - light.turn_off: led_green
+            - delay: !lambda |-
+                float x = id(Active_Power_Rate).state;
+                return (int) (1000 - (x / 100.0) * 900);
+    
+select:
+  - platform: template
+    name: "RRCR Power level"
+    id: rrcr_power_level
+    web_server:
+      sorting_group_id: group_control
+      sorting_weight: 3
+    optimistic: true
+    options:
+      - "0%"
+      - "30%"
+      - "60%"
+      - "100%"
+    restore_value: true
+    initial_option: "100%"
+    icon: mdi:gauge
+    set_action:
+      then:
+        - lambda: |-
+            // make sure only one relay is ever closed at a time
+            id(relay_k1_0pct).turn_off();
+            id(relay_k2_30pct).turn_off();
+            id(relay_k3_60pct).turn_off();
+            id(relay_k4_100pct).turn_off();
+
+            if (x == "0%") {
+              id(relay_k1_0pct).turn_on();
+            } else if (x == "30%") {
+              id(relay_k2_30pct).turn_on();
+            } else if (x == "60%") {
+              id(relay_k3_60pct).turn_on();
+            } else if (x == "100%") {
+              id(relay_k4_100pct).turn_on();
+            }
+
+            id(rrcr_power_level).publish_state(x);
+    
+
+# Growatt read-only sensors with home assistant config
+sensor:
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "AC Active Power"
+    id: AC_active_Power
+    web_server:
+      sorting_group_id: group_ac
+      sorting_weight: 1  
+    address: 35 # Pac H (start van 32-bit waarde)
+    register_count: 2
+    register_type: "read"
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    icon: mdi:power-plug
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "AC Voltage"
+    id: AC_Voltage
+    web_server:
+      sorting_group_id: group_ac
+      sorting_weight: 2
+    address: 38  # Vac1
+    register_type: "read"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    icon: mdi:sine-wave
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "AC Frequency"
+    id: AC_Frequency
+    web_server:
+      sorting_group_id: group_ac
+      sorting_weight: 3 
+    address: 37  # Fac
+    register_type: "read"
+    unit_of_measurement: Hz
+    device_class: frequency
+    state_class: measurement
+    icon: mdi:waveform
+    value_type: U_WORD
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Today Production"
+    id: Today_Production
+    web_server:
+      sorting_group_id: group_ac
+      sorting_weight: 4  
+    address: 53 # EAC today H / Today generate energy (high) / 0.1 kWh
+    register_count: 2
+    register_type: "read"
+    unit_of_measurement: kWh
+    device_class: energy 
+    state_class: measurement 
+    icon: mdi:solar-power
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+    - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Total Production"
+    id: Total_Production
+    web_server:
+      sorting_group_id: group_ac
+      sorting_weight: 5  
+    address: 55 # EAC total H / Total generate energy (high) 0.1kwh
+    register_count: 2
+    register_type: "read"
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    icon: mdi:solar-power
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+    - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv 
+    name: "DC1 Power"
+    id: DC1_Power
+    web_server:
+      sorting_group_id: group_dc
+      sorting_weight: 1
+    address: 5 
+    register_count: 2 
+    register_type: "read"
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    icon: mdi:flash
+    value_type: U_DWORD 
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv 
+    name: "DC1 Voltage"
+    id: DC1_Voltage
+    web_server:
+      sorting_group_id: group_dc
+      sorting_weight: 2
+    address: 3
+    register_type: "read"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    icon: mdi:sine-wave
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv 
+    name: "DC1 Current"
+    id: DC1_Current
+    web_server:
+      sorting_group_id: group_dc
+      sorting_weight: 3
+    address: 4
+    register_type: "read"
+    unit_of_measurement: A
+    device_class: current
+    state_class: measurement
+    icon: mdi:current-ac
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "DC2 Power"
+    id: DC2_Power
+    web_server:
+      sorting_group_id: group_dc
+      sorting_weight: 4
+    address: 9
+    register_count: 2
+    register_type: "read"
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    icon: mdi:flash
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "DC2 Voltage"
+    id: DC2_Voltage
+    web_server:
+      sorting_group_id: group_dc
+      sorting_weight: 5
+    address: 7
+    register_type: "read"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    icon: mdi:sine-wave
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "DC2 Current"
+    id: DC2_Current
+    web_server:
+      sorting_group_id: group_dc
+      sorting_weight: 6
+    address: 8
+    register_type: "read"
+    unit_of_measurement: A
+    device_class: current
+    state_class: measurement
+    icon: mdi:current-ac
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  # Diagnostics
+  
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Heatsink temperature"
+    id: Heatsink_temperature
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 6 
+    address: 93
+    register_type: "read"
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+    icon: mdi:thermometer
+    value_type: U_WORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+  
+  - platform: wifi_signal
+    name: "Bridge WiFi Signal"
+    icon: mdi:wifi
+    update_interval: 10s
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 7
+
+  - platform: uptime
+    name: "Bridge Uptime"
+    update_interval: 10s
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 8
+
+# SunSpec Modbus TCP Server - exposes solar inverter data to Victron
+sunspec_modbus_server:
+  id: sunspec
+  port: 502
+  unit_id: 126
+  manufacturer: ${manufacturer}
+  model: ${model}
+  serial: ${serial}
+  version: ${version}
+  max_power: ${max_power}
+  update_interval: 1s
+
+  # Source sensors from solar inverter
+  source_ac_power: AC_active_Power
+  #source_ac_power: AC_reactive_Power
+  source_voltage: AC_Voltage
+  source_frequency: AC_Frequency
+  source_total_energy: Total_Production
+  source_dc_voltage: DC1_Voltage
+  source_dc_current: DC1_Current
+  source_dc_power: DC1_Power
+  source_temperature: Heatsink_temperature
+  #source_inverter_status: inverter_state
+  target_power_limit: Active_Power_Rate
+    
+
+text_sensor:
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Inverter Status"
+    id: inverter_state
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 5
+    icon: mdi:information
+    address: 0
+    register_type: "read"
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t value = modbus::helpers::word_from_hex_str(x, 0);
+      switch (value) {
+        case 0: return std::string("Waiting");
+        case 1: return std::string("Normal");
+        case 3: return std::string("Fault");
+        default: return std::string("Unknown");
+      }
+    on_value:
+      then:
+        - if:
+            condition:
+              text_sensor.state:
+                id: inverter_state
+                state: "Normal"
+            then:
+              - light.turn_on: led_green
+              - light.turn_off: led_red
+            else:
+              - light.turn_off: led_green
+              - light.turn_on: led_red
+
+  - platform: template
+    name: "${friendly_name} Build Time"
+    lambda: return {__DATE__ " " __TIME__};
+    update_interval: 1h
+    entity_category: diagnostic
+    icon: mdi:clock-outline
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 5
+
+  - platform: template
+    name: "Manufacturer"
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 1
+    lambda: |-
+      return {"${manufacturer}"};
+  - platform: template
+    name: "Model"
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 2
+    lambda: |-
+      return {"${model}"};
+  - platform: template
+    name: "Serial numer"
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 3
+    lambda: |-
+      return {"${serial}"};
+  - platform: template
+    name: "Version"
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 4
+    lambda: |-
+      return {"${version}"};
+  - platform: template
+    name: "Max power"
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 4
+    lambda: |-
+      return {"${max_power} Watt"};
+
+
+button:
+  - platform: restart
+    name: "${friendly_name} Restart"
+    web_server:
+      sorting_group_id: group_device
+      sorting_weight: 9
+
+    
