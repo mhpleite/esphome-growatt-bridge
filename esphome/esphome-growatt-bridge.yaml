@@ -1,11 +1,12 @@
-# esphome-growatt-bridge
-# Version 1.0
-# 
+# growatt-bridge-c3
+# Version 1.1
+# 31-07-2025: Added "Overvoltage Power Reduction".
 #
 # ESPhome bridge based on an ESP32-C3 to control a single phase Growatt inverter (MIC or MID TL-X type via MODbus by Home Assistant. The bride exposed a web-site and publish values to i.e. Victron by Sunspec.
 # Also Victron dynamic power reduction is supported. Check Settings => Integrations => PV_inverters => Select your device => Enable Dynamic power reduction
 # It is also possible to reduce the power by RRCR (Radio Ripple Control Receiver) / DRM (Demand Response Mode). However this is not enabled on most Growatt inverters. 
 # It should be possible to anable RRCD/DRM via ShineTools app or the inverter's local settings.
+# 
 #
 # A special thanks to following repositories and information to create this file
 # https://github.com/JasperE84/Growatt_ESPHome_ESP32_Modbus_RS485_Example
@@ -19,7 +20,7 @@ substitutions:
   manufacturer: "Growatt"
   model: "MIC 3000TL-X"
   serial: "QUH8CKT07Q"
-  version: "PV00.0038500"
+  partnumber: "PV00.0038500"
   max_power: "3000"
 
 esphome:
@@ -98,12 +99,15 @@ web_server:
     - id: group_dc
       name: "DC Input (PV)"
       sorting_weight: 2
+    - id: group_voltage_control
+      name: "Overvoltage Power Reduction"
+      sorting_weight: 3
     - id: group_control
       name: "Control"
-      sorting_weight: 3
+      sorting_weight: 4
     - id: group_device
       name: "Device"
-      sorting_weight: 4
+      sorting_weight: 5
 
 # Define the pins as outputs
 output:
@@ -143,6 +147,19 @@ switch:
       number: GPIO10
       inverted: true
     restore_mode: ALWAYS_ON
+
+  # Enables/disables the automatic voltage-based power control
+  # (see the voltage_power_control interval below). Default ON.
+  - platform: template
+    name: "Voltage Control"
+    id: voltage_control_enable
+    web_server:
+      sorting_group_id: group_voltage_control
+      sorting_weight: 4
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    icon: mdi:sine-wave
 
   # Growatt r/w setting writers
   - platform: modbus_controller
@@ -193,7 +210,7 @@ modbus_controller:
     address: 0x1   ## address of the Modbus slave device on the bus
     modbus_id: modbus_client
     setup_priority: -10
-    update_interval: 10s
+    update_interval: 5s
     command_throttle: 1000ms
 
 # External component from GitHub
@@ -234,6 +251,59 @@ number:
             else:
               - script.execute: blink_led
 
+  # Settings for the automatic voltage-based power control (see the
+  # voltage_power_control interval below).
+  - platform: template
+    name: "Voltage High Threshold"
+    id: voltage_high_threshold
+    web_server:
+      sorting_group_id: group_voltage_control
+      sorting_weight: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 251
+    min_value: 248
+    max_value: 252
+    step: 1
+    unit_of_measurement: "V"
+    entity_category: config
+    icon: mdi:flash-alert
+    mode: SLIDER
+
+  - platform: template
+    name: "Voltage Low Threshold"
+    id: voltage_low_threshold
+    web_server:
+      sorting_group_id: group_voltage_control
+      sorting_weight: 2
+    optimistic: true
+    restore_value: true
+    initial_value: 250
+    min_value: 247
+    max_value: 251
+    step: 1
+    unit_of_measurement: "V"
+    entity_category: config
+    icon: mdi:flash-alert-outline
+    mode: SLIDER
+
+  - platform: template
+    name: "Voltage Control Min Rate"
+    id: voltage_control_min_rate
+    web_server:
+      sorting_group_id: group_voltage_control
+      sorting_weight: 3
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    min_value: 0
+    max_value: 60
+    step: 10
+    unit_of_measurement: "%"
+    entity_category: config
+    icon: mdi:gauge-low
+    mode: SLIDER
+
 script:
   - id: blink_led
     mode: restart
@@ -252,6 +322,85 @@ script:
                 float x = id(Active_Power_Rate).state;
                 return (int) (1000 - (x / 100.0) * 900);
     
+# Voltage-based Active Power Rate control.
+# Every 5s: if AC voltage is too high, step Active Power Rate down (curtail);
+# if it's back within range, step it back up. Clamped to [30, 100]%.
+# Adjust the two thresholds and step sizes below to tune the behaviour.
+# Tracks the "ceiling" the local voltage control must respect.
+# victron_setpoint: the last value Active_Power_Rate was set to by something
+#   other than our own local control (Victron/SunSpec, Home Assistant, the
+#   web UI, etc). Local control is only ever allowed to curtail *below* this.
+# last_local_write: the value we ourselves last wrote, so we can tell our
+#   own writes apart from external ones on the next cycle.
+globals:
+  - id: victron_setpoint
+    type: float
+    restore_value: no
+    initial_value: '100.0'
+  - id: last_local_write
+    type: float
+    restore_value: no
+    initial_value: '100.0'
+
+interval:
+  - id: voltage_power_control
+    interval: 5s
+    then:
+      - lambda: |-
+          // Master on/off switch for this feature
+          if (!id(voltage_control_enable).state) {
+            return;
+          }
+
+          const float REDUCE_STEP  = 20.0;             // percentage points
+          const float INCREASE_STEP = 10.0;            // percentage points
+          const float MAX_RATE = 100.0;                // absolute upper bound
+
+          float voltage = id(AC_Voltage).state;
+          float current_rate = id(Active_Power_Rate).state;
+          float VOLTAGE_HIGH_THRESHOLD = id(voltage_high_threshold).state;
+          float VOLTAGE_LOW_THRESHOLD  = id(voltage_low_threshold).state;
+          float MIN_RATE = id(voltage_control_min_rate).state;
+
+          // Skip if any value isn't valid yet (e.g. inverter offline at boot)
+          if (std::isnan(voltage) || std::isnan(current_rate) ||
+              std::isnan(VOLTAGE_HIGH_THRESHOLD) || std::isnan(VOLTAGE_LOW_THRESHOLD) ||
+              std::isnan(MIN_RATE)) {
+            return;
+          }
+
+          // If the current value doesn't match what we last wrote ourselves,
+          // something external (Victron/SunSpec, HA, web UI...) changed it.
+          // Treat that as the new ceiling for local curtailment.
+          if (std::abs(current_rate - id(last_local_write)) > 0.01f) {
+            id(victron_setpoint) = current_rate;
+            id(last_local_write) = current_rate;
+          }
+
+          float ceiling = id(victron_setpoint);
+          if (ceiling > MAX_RATE) ceiling = MAX_RATE;
+          if (ceiling < MIN_RATE) ceiling = MIN_RATE;
+
+          float new_rate = current_rate;
+
+          if (voltage > VOLTAGE_HIGH_THRESHOLD) {
+            new_rate = current_rate - REDUCE_STEP;
+          } else if (voltage < VOLTAGE_LOW_THRESHOLD) {
+            new_rate = current_rate + INCREASE_STEP;
+          }
+
+          if (new_rate < MIN_RATE) new_rate = MIN_RATE;
+          // Local control may curtail freely, but must never raise the rate
+          // above whatever Victron (or HA/manual) last requested.
+          if (new_rate > ceiling) new_rate = ceiling;
+
+          if (new_rate != current_rate) {
+            auto call = id(Active_Power_Rate).make_call();
+            call.set_value(new_rate);
+            call.perform();
+            id(last_local_write) = new_rate;
+          }
+
 select:
   - platform: template
     name: "RRCR Power level"
@@ -539,7 +688,7 @@ sunspec_modbus_server:
   manufacturer: ${manufacturer}
   model: ${model}
   serial: ${serial}
-  version: ${version}
+  version: ${partnumber}
   max_power: ${max_power}
   update_interval: 1s
 
@@ -558,6 +707,55 @@ sunspec_modbus_server:
     
 
 text_sensor:
+  # Firmware version - Holding registers 9-11 (3 x 16-bit regs = 6 ASCII chars)
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Firmware version"
+    id: "firmware_version"
+    web_server:
+      sorting_group_id: group_device
+    register_type: holding
+    address: 9
+    register_count: 3
+    response_size: 6
+    raw_encode: ANSI
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Control Firmware version"
+    id: "control_firmware_version"
+    web_server:
+      sorting_group_id: group_device
+    register_type: holding
+    address: 12
+    register_count: 3
+    response_size: 6
+    raw_encode: ANSI
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Serial Number"
+    id: "serial_number"
+    web_server:
+      sorting_group_id: group_device
+    register_type: holding
+    address: 209
+    register_count: 15
+    response_size: 30
+    raw_encode: ANSI
+
+  - platform: modbus_controller
+    modbus_controller_id: modbus_pv
+    name: "Product type"
+    id: "Product_type"
+    web_server:
+      sorting_group_id: group_device
+    register_type: holding
+    address: 34
+    register_count: 8
+    response_size: 16
+    raw_encode: ANSI
+  
   - platform: modbus_controller
     modbus_controller_id: modbus_pv
     name: "Inverter Status"
@@ -616,19 +814,19 @@ text_sensor:
     lambda: |-
       return {"${model}"};
   - platform: template
-    name: "Serial numer"
+    name: "Serial nummer"
     web_server:
       sorting_group_id: group_device
       sorting_weight: 3
     lambda: |-
       return {"${serial}"};
   - platform: template
-    name: "Version"
+    name: "partnumber"
     web_server:
       sorting_group_id: group_device
       sorting_weight: 4
     lambda: |-
-      return {"${version}"};
+      return {"${partnumber}"};
   - platform: template
     name: "Max power"
     web_server:
@@ -644,5 +842,3 @@ button:
     web_server:
       sorting_group_id: group_device
       sorting_weight: 9
-
-    
