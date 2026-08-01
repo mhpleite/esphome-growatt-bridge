@@ -1,12 +1,14 @@
 # growatt-bridge-c3
 # Version 1.1
-# 31-07-2025: Added "Overvoltage Power Reduction".
+# 1.0 Initial version
+# 1.1 Added "Volt Watt mode": An algorith that automatically lowers active power output when local grid voltage gets too high.
+#
+#
 #
 # ESPhome bridge based on an ESP32-C3 to control a single phase Growatt inverter (MIC or MID TL-X type via MODbus by Home Assistant. The bride exposed a web-site and publish values to i.e. Victron by Sunspec.
 # Also Victron dynamic power reduction is supported. Check Settings => Integrations => PV_inverters => Select your device => Enable Dynamic power reduction
 # It is also possible to reduce the power by RRCR (Radio Ripple Control Receiver) / DRM (Demand Response Mode). However this is not enabled on most Growatt inverters. 
 # It should be possible to anable RRCD/DRM via ShineTools app or the inverter's local settings.
-# 
 #
 # A special thanks to following repositories and information to create this file
 # https://github.com/JasperE84/Growatt_ESPHome_ESP32_Modbus_RS485_Example
@@ -99,8 +101,8 @@ web_server:
     - id: group_dc
       name: "DC Input (PV)"
       sorting_weight: 2
-    - id: group_voltage_control
-      name: "Overvoltage Power Reduction"
+    - id: volt_watt_mode
+      name: "Volt Watt mode"
       sorting_weight: 3
     - id: group_control
       name: "Control"
@@ -151,10 +153,10 @@ switch:
   # Enables/disables the automatic voltage-based power control
   # (see the voltage_power_control interval below). Default ON.
   - platform: template
-    name: "Voltage Control"
-    id: voltage_control_enable
+    name: "Volt Watt mode On - Off"
+    id: volt_watt_mode_enable
     web_server:
-      sorting_group_id: group_voltage_control
+      sorting_group_id: volt_watt_mode
       sorting_weight: 4
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
@@ -257,7 +259,7 @@ number:
     name: "Voltage High Threshold"
     id: voltage_high_threshold
     web_server:
-      sorting_group_id: group_voltage_control
+      sorting_group_id: volt_watt_mode
       sorting_weight: 1
     optimistic: true
     restore_value: true
@@ -274,7 +276,7 @@ number:
     name: "Voltage Low Threshold"
     id: voltage_low_threshold
     web_server:
-      sorting_group_id: group_voltage_control
+      sorting_group_id: volt_watt_mode
       sorting_weight: 2
     optimistic: true
     restore_value: true
@@ -291,7 +293,7 @@ number:
     name: "Voltage Control Min Rate"
     id: voltage_control_min_rate
     web_server:
-      sorting_group_id: group_voltage_control
+      sorting_group_id: volt_watt_mode
       sorting_weight: 3
     optimistic: true
     restore_value: true
@@ -348,7 +350,7 @@ interval:
     then:
       - lambda: |-
           // Master on/off switch for this feature
-          if (!id(voltage_control_enable).state) {
+          if (!id(volt_watt_mode_enable).state) {
             return;
           }
 
