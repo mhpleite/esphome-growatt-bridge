@@ -1,7 +1,42 @@
 # growatt-bridge-c3
-# Version 1.1
+# Version 1.7
 # 1.0 Initial version
 # 1.1 Added "Volt Watt mode": An algorith that automatically lowers active power output when local grid voltage gets too high.
+# 1.2 Volt Watt mode now uses a linear voltage-to-rate ramp (quantized to 10% steps) between the low/high voltage
+#     thresholds, instead of pure hysteresis: below Voltage Low Threshold the rate target is always 100%, above
+#     Voltage High Threshold it's Voltage Control Min Rate, and in between it ramps linearly. The rate is moved
+#     toward that target in steps of 10 percentage points per 1s cycle.
+# 1.3 The rate step size is no longer a fixed 10%. It's now derived from the AC_Voltage sensor's 0.1V resolution:
+#     the number of 0.1V increments between Voltage Low Threshold and Voltage High Threshold is used to divide the
+#     (100% - Voltage Control Min Rate) rate range, so each 0.1V change in measured voltage corresponds to one rate
+#     step. Both the target quantization and the per-cycle movement step use this derived value.
+# 1.4 Fixed a bug where Active Power Rate would not always recover back to 100% after voltage dropped
+#     below Voltage Low Threshold. The modbus_controller only reads register 3 back on its own ~2s poll
+#     cycle, so right after the loop wrote a new rate itself, the sensor's state could still show the old
+#     value for a cycle or two - the loop mistook that stale readback for an external change (Victron/HA/
+#     web UI) and permanently clamped the recovery ceiling too low. Added a short grace period (skipping
+#     external-change detection for ~3s) after every local write, and the loop now steps from its own
+#     tracked last-written value instead of the possibly-stale sensor reading.
+# 1.5 The fixed 3s grace period from 1.4 still wasn't always long enough: modbus_pv polls ~20 registers
+#     at one command per second, so a full round trip back to register 3 can take much longer than 3s,
+#     and the recovery-to-100% bug could still occur. Replaced the fixed grace period with confirmation-
+#     based detection: after a local write, external-change detection stays paused until the readback has
+#     actually been observed to match what was written, however long that takes, instead of a guessed
+#     timeout. Also logs a message when a genuine external change is detected, to help verify behaviour.
+# 1.6 Added three diagnostic entities to the "Volt Watt mode" web page section so the loop's internal
+#     state can be observed directly instead of inferred: "Victron Setpoint (ceiling)" (the local ceiling
+#     the loop is currently respecting), "Last Local Write" (the value the loop itself last wrote), and
+#     "Local Write Status" (whether the loop is still waiting for a write to be confirmed by the modbus
+#     readback, or has confirmed it). Useful for pinpointing whether "ceiling" is genuinely being set by
+#     an external write, or something else is preventing recovery to 100%.
+# 1.7 Diagnostics in 1.6 showed the ceiling was working exactly as designed: Victron (via SunSpec dynamic
+#     power reduction writing to target_power_limit) had genuinely set the Active Power Rate to below
+#     100%, and since Victron never refreshed that value, local voltage-based recovery stayed capped at
+#     it indefinitely, even once voltage was well within safe range. Added a 1-minute expiry: if Victron
+#     (or HA/web UI) hasn't refreshed its setpoint within VICTRON_CEILING_TIMEOUT_MS (60000ms) of it last
+#     changing, the ceiling is released back to 100% so local voltage control can recover fully on its
+#     own. Added a "Victron Ceiling Age" sensor (seconds since the ceiling was last refreshed) to the web
+#     page to make this visible, and a log line when the ceiling expires.
 #
 #
 #
@@ -212,7 +247,7 @@ modbus_controller:
     address: 0x1   ## address of the Modbus slave device on the bus
     modbus_id: modbus_client
     setup_priority: -10
-    update_interval: 5s
+    update_interval: 2s
     command_throttle: 1000ms
 
 # External component from GitHub
@@ -264,8 +299,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 251
-    min_value: 248
-    max_value: 252
+    min_value: 250
+    max_value: 253
     step: 1
     unit_of_measurement: "V"
     entity_category: config
@@ -281,8 +316,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 250
-    min_value: 247
-    max_value: 251
+    min_value: 249
+    max_value: 252
     step: 1
     unit_of_measurement: "V"
     entity_category: config
@@ -333,7 +368,18 @@ script:
 #   other than our own local control (Victron/SunSpec, Home Assistant, the
 #   web UI, etc). Local control is only ever allowed to curtail *below* this.
 # last_local_write: the value we ourselves last wrote, so we can tell our
-#   own writes apart from external ones on the next cycle.
+#   own writes apart from external ones.
+# awaiting_local_confirmation: true from the moment we write until we've
+#   actually seen the modbus readback match that write. While true, we don't
+#   trust id(Active_Power_Rate).state for external-change detection, since
+#   modbus_pv polls ~20 registers at 1 command/s, so a full round trip back
+#   to register 3 can take far longer than a fixed couple of seconds.
+# victron_setpoint_last_update: millis() timestamp of the last time an
+#   external change was detected. If Victron doesn't refresh its setpoint
+#   within VICTRON_CEILING_TIMEOUT_MS, the ceiling expires back to 100% so
+#   local voltage-based recovery isn't blocked forever by a stale request.
+# victron_ceiling_active: whether victron_setpoint currently reflects a
+#   real external request (vs. still being the untouched initial value).
 globals:
   - id: victron_setpoint
     type: float
@@ -343,10 +389,22 @@ globals:
     type: float
     restore_value: no
     initial_value: '100.0'
+  - id: awaiting_local_confirmation
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: victron_setpoint_last_update
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: victron_ceiling_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 interval:
   - id: voltage_power_control
-    interval: 5s
+    interval: 1s
     then:
       - lambda: |-
           // Master on/off switch for this feature
@@ -354,41 +412,105 @@ interval:
             return;
           }
 
-          const float REDUCE_STEP  = 20.0;             // percentage points
-          const float INCREASE_STEP = 10.0;            // percentage points
-          const float MAX_RATE = 100.0;                // absolute upper bound
+          const float MAX_RATE = 100.0;                 // absolute upper bound
+          const float VOLTAGE_RESOLUTION = 0.1;          // AC_Voltage sensor resolution (V)
 
           float voltage = id(AC_Voltage).state;
-          float current_rate = id(Active_Power_Rate).state;
+          float sensor_rate = id(Active_Power_Rate).state;
           float VOLTAGE_HIGH_THRESHOLD = id(voltage_high_threshold).state;
           float VOLTAGE_LOW_THRESHOLD  = id(voltage_low_threshold).state;
           float MIN_RATE = id(voltage_control_min_rate).state;
 
           // Skip if any value isn't valid yet (e.g. inverter offline at boot)
-          if (std::isnan(voltage) || std::isnan(current_rate) ||
+          if (std::isnan(voltage) || std::isnan(sensor_rate) ||
               std::isnan(VOLTAGE_HIGH_THRESHOLD) || std::isnan(VOLTAGE_LOW_THRESHOLD) ||
               std::isnan(MIN_RATE)) {
             return;
           }
 
-          // If the current value doesn't match what we last wrote ourselves,
-          // something external (Victron/SunSpec, HA, web UI...) changed it.
-          // Treat that as the new ceiling for local curtailment.
-          if (std::abs(current_rate - id(last_local_write)) > 0.01f) {
-            id(victron_setpoint) = current_rate;
-            id(last_local_write) = current_rate;
+          // Don't trust the sensor for external-change detection until we've
+          // actually seen it confirm our last write. This avoids guessing a
+          // fixed timeout for how long the modbus readback takes (it shares
+          // the bus with ~20 other registers, so that can vary a lot).
+          if (id(awaiting_local_confirmation)) {
+            if (std::abs(sensor_rate - id(last_local_write)) <= 0.01f) {
+              // Readback caught up with our last write - safe to resume
+              // watching for genuine external changes.
+              id(awaiting_local_confirmation) = false;
+            }
+            // Still stale (or coincidentally equal, either way nothing to do)
+          } else if (std::abs(sensor_rate - id(last_local_write)) > 0.01f) {
+            // We already had a confirmed match at some point, and now the
+            // value differs from what we last wrote - so something external
+            // (Victron/SunSpec, HA, web UI) changed it. Treat that as the
+            // new ceiling for local curtailment.
+            ESP_LOGI("volt_watt", "External Active Power Rate change detected: %.1f%% -> %.1f%%, ceiling updated", id(last_local_write), sensor_rate);
+            id(victron_setpoint) = sensor_rate;
+            id(last_local_write) = sensor_rate;
+            id(victron_setpoint_last_update) = millis();
+            id(victron_ceiling_active) = true;
           }
+
+          // If Victron (or HA/web UI) hasn't refreshed its setpoint within
+          // this window, stop treating it as a binding ceiling and let
+          // voltage control recover to 100% on its own. Change this to
+          // adjust how long a Victron request stays in force without being
+          // refreshed.
+          const uint32_t VICTRON_CEILING_TIMEOUT_MS = 60000; // 1 minute
+          if (id(victron_ceiling_active) &&
+              (millis() - id(victron_setpoint_last_update) > VICTRON_CEILING_TIMEOUT_MS)) {
+            ESP_LOGI("volt_watt", "Victron ceiling (%.1f%%) expired after %us with no refresh - releasing to 100%%",
+                     id(victron_setpoint), (unsigned)((millis() - id(victron_setpoint_last_update)) / 1000));
+            id(victron_setpoint) = MAX_RATE;
+            id(victron_ceiling_active) = false;
+          }
+
+          // Use our own tracked value as "current_rate" for stepping, so a
+          // still-stale sensor reading right after our own write can't
+          // throw off the ramp calculation.
+          float current_rate = id(last_local_write);
 
           float ceiling = id(victron_setpoint);
           if (ceiling > MAX_RATE) ceiling = MAX_RATE;
           if (ceiling < MIN_RATE) ceiling = MIN_RATE;
 
-          float new_rate = current_rate;
+          // How many distinct 0.1V steps fit between the two thresholds. The
+          // rate step size is derived from this, so each 0.1V change in the
+          // measured AC voltage corresponds to (at most) one rate step -
+          // matching the resolution of the AC_Voltage sensor itself.
+          float span = VOLTAGE_HIGH_THRESHOLD - VOLTAGE_LOW_THRESHOLD;
+          float num_voltage_steps = (span > 0) ? round(span / VOLTAGE_RESOLUTION) : 0;
+          float RATE_STEP = (num_voltage_steps > 0) ? (MAX_RATE - MIN_RATE) / num_voltage_steps : (MAX_RATE - MIN_RATE);
+          if (RATE_STEP <= 0) RATE_STEP = 1.0; // safety fallback, avoids div-by-zero style issues
 
-          if (voltage > VOLTAGE_HIGH_THRESHOLD) {
-            new_rate = current_rate - REDUCE_STEP;
-          } else if (voltage < VOLTAGE_LOW_THRESHOLD) {
-            new_rate = current_rate + INCREASE_STEP;
+          // Work out the target rate for the current voltage:
+          //  - at/below VOLTAGE_LOW_THRESHOLD  -> 100%
+          //  - at/above VOLTAGE_HIGH_THRESHOLD -> MIN_RATE
+          //  - in between                      -> linear ramp, quantized to RATE_STEP
+          float target_rate;
+          if (voltage <= VOLTAGE_LOW_THRESHOLD) {
+            target_rate = MAX_RATE;
+          } else if (voltage >= VOLTAGE_HIGH_THRESHOLD) {
+            target_rate = MIN_RATE;
+          } else if (span > 0) {
+            float frac = (voltage - VOLTAGE_LOW_THRESHOLD) / span; // 0..1, 0=low, 1=high
+            target_rate = MAX_RATE - frac * (MAX_RATE - MIN_RATE);
+            target_rate = round(target_rate / RATE_STEP) * RATE_STEP; // quantize to one rate step per 0.1V
+          } else {
+            target_rate = MIN_RATE;
+          }
+          if (target_rate < MIN_RATE) target_rate = MIN_RATE;
+          if (target_rate > MAX_RATE) target_rate = MAX_RATE;
+
+          // Move current_rate toward target_rate by at most one RATE_STEP per
+          // cycle, never overshooting the target.
+          float new_rate = current_rate;
+          if (target_rate > current_rate) {
+            new_rate = current_rate + RATE_STEP;
+            if (new_rate > target_rate) new_rate = target_rate;
+          } else if (target_rate < current_rate) {
+            new_rate = current_rate - RATE_STEP;
+            if (new_rate < target_rate) new_rate = target_rate;
           }
 
           if (new_rate < MIN_RATE) new_rate = MIN_RATE;
@@ -396,11 +518,12 @@ interval:
           // above whatever Victron (or HA/manual) last requested.
           if (new_rate > ceiling) new_rate = ceiling;
 
-          if (new_rate != current_rate) {
+          if (std::abs(new_rate - current_rate) > 0.01f) {
             auto call = id(Active_Power_Rate).make_call();
             call.set_value(new_rate);
             call.perform();
             id(last_local_write) = new_rate;
+            id(awaiting_local_confirmation) = true;
           }
 
 select:
@@ -443,6 +566,56 @@ select:
 
 # Growatt read-only sensors with home assistant config
 sensor:
+  # Debug/diagnostic sensors for the voltage-based power control loop.
+  # Watch these on the web page (or in HA) to see exactly what the loop
+  # thinks is going on - in particular, whether "Victron Setpoint (ceiling)"
+  # ever gets stuck below 100% when it shouldn't be.
+  - platform: template
+    name: "Victron Setpoint (ceiling)"
+    id: victron_setpoint_sensor
+    web_server:
+      sorting_group_id: volt_watt_mode
+      sorting_weight: 5
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: mdi:target
+    update_interval: 1s
+    lambda: |-
+      return id(victron_setpoint);
+
+  - platform: template
+    name: "Last Local Write"
+    id: last_local_write_sensor
+    web_server:
+      sorting_group_id: volt_watt_mode
+      sorting_weight: 6
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: mdi:pencil
+    update_interval: 1s
+    lambda: |-
+      return id(last_local_write);
+
+  # Seconds since Victron (or HA/web UI) last actually changed the Active
+  # Power Rate register. Once this passes 60s, the ceiling above expires
+  # back to 100% and local voltage-based recovery is no longer capped by it.
+  # Shows "unknown" if no external write has been seen since boot.
+  - platform: template
+    name: "Victron Ceiling Age"
+    id: victron_setpoint_age_sensor
+    web_server:
+      sorting_group_id: volt_watt_mode
+      sorting_weight: 8
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    icon: mdi:timer-sand
+    update_interval: 1s
+    lambda: |-
+      if (!id(victron_ceiling_active)) {
+        return NAN;
+      }
+      return (millis() - id(victron_setpoint_last_update)) / 1000.0f;
+
   - platform: modbus_controller
     modbus_controller_id: modbus_pv
     name: "AC Active Power"
@@ -709,6 +882,22 @@ sunspec_modbus_server:
     
 
 text_sensor:
+  # Whether the voltage-control loop is currently waiting to see its last
+  # write reflected back from the inverter before trusting the sensor for
+  # external-change detection again. If this is stuck on "Waiting..." for
+  # a long time, the modbus readback for Active Power Rate isn't updating
+  # at all - worth checking the modbus/modbus_controller logs for errors.
+  - platform: template
+    name: "Local Write Status"
+    id: local_write_status
+    web_server:
+      sorting_group_id: volt_watt_mode
+      sorting_weight: 7
+    icon: mdi:sync
+    update_interval: 1s
+    lambda: |-
+      return id(awaiting_local_confirmation) ? std::string("Waiting for readback...") : std::string("Confirmed");
+
   # Firmware version - Holding registers 9-11 (3 x 16-bit regs = 6 ASCII chars)
   - platform: modbus_controller
     modbus_controller_id: modbus_pv
