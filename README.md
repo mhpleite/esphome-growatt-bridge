@@ -2,7 +2,7 @@
 
 An [ESPHome](https://esphome.io/) configuration that turns a cheap **ESP32-C3** board into a Modbus bridge for a single-phase **Growatt inverter** (MIC / MID TL-X series). It reads live data from the inverter over RS485/Modbus RTU, exposes it to **Home Assistant**, serves a built-in **web dashboard**, and re-publishes the data as a **SunSpec Modbus TCP server** so it can be picked up by **Victron** equipment (e.g. GX devices / VenusOS) — including support for Victron's **Dynamic Power Reduction**.
 
-Version 1.1 implemented a "Volt Watt mode" algorith that reduced active power when the grid voltage becomes too high.
+Version 1.1 implemented a "Volt Watt curtailment mode" algorith that reduced active power when the grid voltage becomes too high.
 As a bonus, it also supports old-school **RRCR / DRM (Demand Response Mode)** power curtailment via 4 relays, for inverters/setups where the ripple-control input is wired up.
 
 > Credit to the projects this build stands on:
